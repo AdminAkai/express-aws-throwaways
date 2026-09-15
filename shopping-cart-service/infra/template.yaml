@@ -1,0 +1,153 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Shopping cart service - HTTP API (API Gateway) -> Lambda (Express via
+  serverless-http) -> DynamoDB. Plain CloudFormation, no SAM transform, so
+  every resource involved in the Lambda/API Gateway wiring is explicit.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    Description: Used to namespace resource names (CartItems-<env>, cart-service-<env>, ...)
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: >
+      S3 bucket holding the Lambda deployment package. Left as a plain
+      parameter (rather than filled in by `aws cloudformation package`)
+      so the bucket/key are visible and swappable.
+  LambdaCodeS3Key:
+    Type: String
+    Default: shopping-cart-service/lambda.zip
+    Description: S3 key of the zipped Lambda bundle (see infra/deploy.sh)
+
+Resources:
+  # ---------------------------------------------------------------------
+  # Data layer
+  # ---------------------------------------------------------------------
+  CartTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub CartItems-${EnvironmentName}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+
+  # ---------------------------------------------------------------------
+  # Compute layer
+  # ---------------------------------------------------------------------
+  CartFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub cart-service-${EnvironmentName}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CartTableAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                Resource: !GetAtt CartTable.Arn
+
+  CartFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/cart-service-${EnvironmentName}
+      RetentionInDays: 7
+
+  CartFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub cart-service-${EnvironmentName}
+      Runtime: nodejs20.x
+      Handler: lambda.handler
+      MemorySize: 256
+      Timeout: 10
+      Role: !GetAtt CartFunctionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          CART_TABLE_NAME: !Ref CartTable
+    DependsOn: CartFunctionLogGroup
+
+  # ---------------------------------------------------------------------
+  # API layer - HTTP API (cheaper/simpler than REST API for a single Lambda
+  # proxy integration). Express owns actual route matching, so API Gateway
+  # just forwards everything to the function.
+  # ---------------------------------------------------------------------
+  CartHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub cart-service-${EnvironmentName}
+      ProtocolType: HTTP
+
+  CartHttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref CartHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt CartFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  CartHttpApiRouteProxy:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref CartHttpApi
+      RouteKey: "ANY /{proxy+}"
+      Target: !Sub integrations/${CartHttpApiIntegration}
+
+  CartHttpApiRouteRoot:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref CartHttpApi
+      RouteKey: "ANY /"
+      Target: !Sub integrations/${CartHttpApiIntegration}
+
+  CartHttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref CartHttpApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  CartApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CartFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CartHttpApi}/*/*
+
+Outputs:
+  ApiEndpoint:
+    Description: Base URL for the HTTP API
+    Value: !Sub https://${CartHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  TableName:
+    Description: DynamoDB table name
+    Value: !Ref CartTable
+  FunctionName:
+    Description: Lambda function name
+    Value: !Ref CartFunction
